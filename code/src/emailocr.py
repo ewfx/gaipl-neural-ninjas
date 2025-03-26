@@ -21,6 +21,71 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+class AttachmentProcessorFactory:
+    """
+    Factory class to create appropriate attachment processors based on content type.
+    """
+    @staticmethod
+    def get_processor(content_type):
+        if content_type.startswith('image/'):
+            return ImageProcessor()
+        elif content_type == 'application/pdf':
+            return PDFProcessor()
+        elif content_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            return DOCXProcessor()
+        elif content_type == 'text/plain':
+            return TextProcessor()
+        else:
+            return None
+
+
+class BaseAttachmentProcessor:
+    """
+    Base class for attachment processors.
+    """
+    def process(self, file_data):
+        raise NotImplementedError("Subclasses must implement the process method.")
+
+
+class ImageProcessor(BaseAttachmentProcessor):
+    def process(self, file_data):
+        try:
+            image = Image.open(io.BytesIO(file_data))
+            return pytesseract.image_to_string(image) + "\n"
+        except Exception as e:
+            logging.error(f"Error processing image: {e}")
+            return ""
+
+
+class PDFProcessor(BaseAttachmentProcessor):
+    def process(self, file_data):
+        try:
+            pdf = PdfReader(io.BytesIO(file_data))
+            return "\n".join([page.extract_text() for page in pdf.pages])
+        except Exception as e:
+            logging.error(f"Error processing PDF: {e}")
+            return ""
+
+
+class DOCXProcessor(BaseAttachmentProcessor):
+    def process(self, file_data):
+        try:
+            doc = Document(io.BytesIO(file_data))
+            return "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        except Exception as e:
+            logging.error(f"Error processing DOCX: {e}")
+            return ""
+
+
+class TextProcessor(BaseAttachmentProcessor):
+    def process(self, file_data):
+        try:
+            return file_data.decode('utf-8') + "\n"
+        except Exception as e:
+            logging.error(f"Error processing text file: {e}")
+            return ""
+
+
 class EmailProcessor:
     def __init__(self):
         self.processed_hashes = set()
@@ -68,6 +133,9 @@ class EmailProcessor:
             logging.error(f"Error fetching emails: {e}")
 
     def process_attachments(self, msg):
+        """
+        Process attachments using the factory pattern.
+        """
         extracted_text = ""
         for part in msg.walk():
             if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
@@ -77,64 +145,94 @@ class EmailProcessor:
             if file_name:
                 file_data = part.get_payload(decode=True)
                 content_type = part.get_content_type()
-                try:
-                    if content_type.startswith('image/'):
-                        extracted_text += self._process_image(file_data)
-                    elif content_type == 'application/pdf':
-                        extracted_text += self._process_pdf(file_data)
-                    elif content_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                        extracted_text += self._process_docx(file_data)
-                    elif content_type == 'text/plain':
-                        extracted_text += file_data.decode('utf-8')
-                except Exception as e:
-                    logging.warning(f"Failed to process attachment {file_name}: {e}")
+                processor = AttachmentProcessorFactory.get_processor(content_type)
+                if processor:
+                    extracted_text += processor.process(file_data)
+                else:
+                    logging.warning(f"No processor found for content type: {content_type}")
         return extracted_text
 
-    def _process_image(self, file_data):
-        try:
-            image = Image.open(io.BytesIO(file_data))
-            return pytesseract.image_to_string(image) + "\n"
-        except Exception as e:
-            logging.error(f"Error processing image: {e}")
-            return ""
-
-    def _process_pdf(self, file_data):
-        try:
-            pdf = PdfReader(io.BytesIO(file_data))
-            return "\n".join([page.extract_text() for page in pdf.pages])
-        except Exception as e:
-            logging.error(f"Error processing PDF: {e}")
-            return ""
-
-    def _process_docx(self, file_data):
-        try:
-            doc = Document(io.BytesIO(file_data))
-            return "\n".join([paragraph.text for paragraph in doc.paragraphs])
-        except Exception as e:
-            logging.error(f"Error processing DOCX: {e}")
-            return ""
-
     def analyze_email(self, text):
-        prompt = f"""Analyze this email and return JSON with:
-- Primary intent (sales, support, billing, other)
-- Priority (high, medium, low)
-- Key entities (names, dates, amounts)
-- Multiple requests (list of individual requests)
-- Summary
-- Sentiment (positive, neutral, negative)
-
-Email: {text[:3000]}"""  # Truncate to fit context window
-
+        """
+        Analyze the email content using OpenAI GPT-3.5 and return structured data.
+        """
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-            return json.loads(response.choices[0].message['content'])
+            # Step 1: Construct the prompt dynamically
+            prompt = self._construct_prompt(text)
+
+            # Step 2: Call the OpenAI API
+            response = self._call_openai_api(prompt)
+
+            # Step 3: Parse and validate the response
+            analysis = self._parse_response(response)
+
+            return analysis
         except Exception as e:
             logging.error(f"Error analyzing email: {e}")
-            return {}
+            return self._default_analysis()
+
+    def _construct_prompt(self, text):
+        """
+        Construct a dynamic prompt for the OpenAI API.
+        """
+        truncated_text = text[:3000]  # Truncate to fit within the model's token limit
+        return f"""Analyze this email and return JSON with:
+        - Primary intent (sales, support, billing, other)
+        - Priority (high, medium, low)
+        - Key entities (names, dates, amounts)
+        - Multiple requests (list of individual requests)
+        - Summary
+        - Sentiment (positive, neutral, negative)
+
+        Email: {truncated_text}"""
+
+    def _call_openai_api(self, prompt):
+        """
+        Call the OpenAI API with retries for robustness.
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+                return response
+            except openai.error.OpenAIError as e:
+                logging.warning(f"OpenAI API error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise
+
+    def _parse_response(self, response):
+        """
+        Parse the OpenAI API response and validate the output.
+        """
+        try:
+            content = response.choices[0].message['content']
+            analysis = json.loads(content)
+            # Validate required fields
+            required_fields = ['primary_intent', 'priority', 'summary', 'sentiment']
+            for field in required_fields:
+                if field not in analysis:
+                    raise ValueError(f"Missing field in analysis: {field}")
+            return analysis
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logging.error(f"Error parsing OpenAI response: {e}")
+            raise
+
+    def _default_analysis(self):
+        """
+        Return a default analysis in case of failure.
+        """
+        return {
+            "primary_intent": "unknown",
+            "priority": "medium",
+            "summary": "No summary available.",
+            "sentiment": "neutral",
+            "key_entities": [],
+            "multiple_requests": []
+        }
 
     def detect_duplicate(self, content):
         try:
@@ -171,12 +269,35 @@ Email: {text[:3000]}"""  # Truncate to fit context window
             logging.error(f"Error saving email to database: {e}")
 
     def process_email(self, msg):
+        """
+        Template method for processing an email.
+        """
+        email_data = self._extract_email_metadata(msg)
+        attachment_text = self.process_attachments(msg)
+        full_text = email_data['body'] + "\n" + attachment_text
+
+        if self.detect_duplicate(full_text):
+            logging.info(f"Duplicate email detected: {email_data['subject']}")
+            return None
+
+        analysis = self.analyze_email(full_text)
+        email_data.update({
+            'analysis': analysis,
+            'priority': analysis.get('priority', 'medium'),
+            'requires_followup': 'yes' if analysis.get('multiple_requests') else 'no'
+        })
+        self.save_to_database(email_data)
+        return email_data
+
+    def _extract_email_metadata(self, msg):
+        """
+        Extract metadata (e.g., sender, subject, body) from the email.
+        """
         email_data = {
             'from': msg.get('from', 'unknown'),
             'subject': msg.get('subject', 'No Subject'),
             'date': parsedate_to_datetime(msg.get('date', '')),
-            'body': "",
-            'attachments': []
+            'body': ""
         }
 
         try:
@@ -193,20 +314,6 @@ Email: {text[:3000]}"""  # Truncate to fit context window
         except Exception as e:
             logging.error(f"Error extracting email body: {e}")
 
-        attachment_text = self.process_attachments(msg)
-        full_text = email_data['body'] + "\n" + attachment_text
-
-        if self.detect_duplicate(full_text):
-            logging.info(f"Duplicate email detected: {email_data['subject']}")
-            return None
-
-        analysis = self.analyze_email(full_text)
-        email_data.update({
-            'analysis': analysis,
-            'priority': analysis.get('priority', 'medium'),
-            'requires_followup': 'yes' if analysis.get('multiple_requests') else 'no'
-        })
-        self.save_to_database(email_data)
         return email_data
 
     def run(self):
